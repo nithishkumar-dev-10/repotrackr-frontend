@@ -1,0 +1,6 @@
+{
+  "name": "RepoTrackr AI",
+  "description": "Backend tool for ingesting GitHub repositories, building deterministic indices and code analysis, and reasoning over evidence.",
+  "requestFramePermissions": [],
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

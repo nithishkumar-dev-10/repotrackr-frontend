@@ -1,0 +1,833 @@
+# Project Summary
+
+## What This Project Is
+RepoTrackr AI is a backend-first tool for ingesting GitHub repositories and reasoning about them: it clones a repo, builds a deterministic index and static analysis of the code, and only then lets an AI layer explain things on top of that evidence. Right now the foundation exists — settings, the database engine, the SQLAlchemy models, the first Alembic migration, and a FastAPI app that serves `GET /health` plus a complete email/password auth flow (signup, email verification, resend, login, token refresh, logout, forgot/reset/change password, delete account, and `GET /auth/me`) with per-IP rate limiting on the abuse-prone endpoints, CORS, and consistent JSON error handling, plus a repo-records feature (add, list, get, delete a saved GitHub link, with duplicate blocking). Every Part 2–4 endpoint is also registered as a stub that verifies repo ownership and returns `501 {"status": "not_implemented"}`, so the frontend is already wired. The deterministic pipeline, analysis, AI and frontend are still scaffolded but empty.
+
+## Project Structure
+```
+RepoTrackr-AI/
+├── .gitignore                       # Ignores logs/secrets/build junk
+├── .env.example                     # Environment template
+├── AGENTS.md                        # Working rules for contributors/agents
+├── README.md                        # Setup, run, test, folder map, docs links
+├── metadata.json                    # AI Studio metadata
+├── package.json                     # Node.js dependencies and run scripts
+├── tsconfig.json                    # TypeScript configuration
+├── docs/
+│   ├── RepoTrackr-AI-Execution-Plan.md  # Roadmap (Parts 1-4)
+│   ├── project_summary.md           # This file (canonical)
+│   ├── changes.md                   # Chronological changes log
+│   ├── api_contract.md              # Endpoint contract for Parts 1-4
+│   ├── mock_responses.md            # Example JSON for frontend mocks
+│   └── openapi.json                 # OpenAPI 3.1 specification
+├── src/
+│   ├── index.ts                     # Express server & Vite middleware entry point
+│   ├── config.ts                    # Application config & environment loader
+│   ├── db.ts                        # In-memory persistence (Users, EmailTokens, Repos)
+│   ├── security.ts                  # Password hashing (bcryptjs), JWT, email tokens
+│   ├── schemas.ts                   # GitHub URL parsing, normalization & error payload builder
+│   ├── api/
+│   │   ├── client.ts                # HTTP client with observability log emitter
+│   │   └── galaxy.ts                # Galaxy API layer with 501 fallback & typed mocks
+│   ├── types/
+│   │   └── galaxy.ts                # Typed interfaces for 3D graph, Reader, Plan, Context
+│   ├── mock/
+│   │   └── galaxyData.ts            # ~80-node clustered Python graph & mode responses
+│   ├── client/
+│   │   ├── main.tsx                 # React DOM root entry point
+│   │   ├── App.tsx                  # React Router with AnimatePresence transitions & lazy-loaded 3D workspace
+│   │   ├── index.css                # Global CSS tokens & Tailwind styling
+│   │   ├── context/
+│   │   │   └── AuthContext.tsx      # User authentication session context
+│   │   ├── components/
+│   │   │   ├── Navbar.tsx           # Persistent top header with animated link underline
+│   │   │   ├── CommandBar.tsx       # Ctrl/Cmd+K query search bar
+│   │   │   ├── InteractiveDemo.tsx  # Product demo card with self-typing loop, code citations & glowing 2D path
+│   │   │   ├── TrackRepoModal.tsx   # Add repo modal with URL validation
+│   │   │   ├── MermaidViewer.tsx    # 2D diagram renderer fallback
+│   │   │   ├── 2d/
+│   │   │   │   ├── SvgNetworkIllustration.tsx # Interactive 2D SVG network illustration for auth split screens
+│   │   │   │   └── SvgMiniGraphThumbnail.tsx  # 2D SVG animated graph thumbnail for dashboard cards
+│   │   │   └── 3d/
+│   │   │       └── GalaxyCanvas.tsx # Flagship 3D Repo Galaxy with bloom & beams (isolated to /repo/:id)
+│   │   └── pages/
+│   │       ├── LandingPage.tsx      # Light hero, InteractiveDemo, magnetic CTA, scroll-linked pipeline & stats
+│   │       ├── LoginPage.tsx        # Split-screen login with 2D SVG network illustration
+│   │       ├── SignupPage.tsx       # Split-screen signup with password meter & 2D SVG illustration
+│   │       ├── VerifyEmailPage.tsx  # Split-screen verification with 2D SVG illustration
+│   │       ├── DashboardPage.tsx    # Repository grid with 2D SVG thumbnails (zero WebGL)
+│   │       ├── RepoWorkspacePage.tsx# Main Repo Galaxy dual-pane 3D workspace (isolated WebGL)
+│   │       └── DeveloperPage.tsx    # Endpoint matrix & live API Activity Inspector
+│   ├── middleware/
+│   │   └── auth.ts                  # requireAuth (Bearer JWT) and requireOwnedRepo middleware
+│   └── routes/
+│       ├── auth.ts                  # Auth routes (signup, verify, login, refresh, me, etc.)
+│       ├── repos.ts                 # Repo routes (add, list, get, delete)
+│       └── stubs.ts                 # Parts 2-4 stub routes (501 not_implemented)
+├── evals/                           # Evals scaffold
+└── scripts/                         # Automation scripts
+```
+
+## The Stack at a Glance
+Settings -> Database Core -> Data Models -> Schema Migrations (Alembic) -> Pipeline & Analysis -> AI Layer -> Features & HTTP API -> Frontend, with Docker/Evals/Scripts as supporting tooling.
+
+(Layers 1–4 are fully built. Layer 7 has its app factory, `GET /health`, the complete auth feature with rate limiting, the repo-records feature (add/list/get/delete), the Part 2–4 stub endpoints, the Pydantic schemas, the endpoint/mock/OpenAPI/Postman contract, and the `security` helpers (password hashing, JWT, email tokens), plus unit and endpoint tests. Everything above Layer 7 is an empty folder skeleton.)
+
+## Layer by Layer
+
+### Layer 1: Settings & Configuration
+
+**What it is:** The single typed object that reads every configuration value (database URL, secrets, CORS, SMTP) from `backend/.env`.
+**Why it exists:** Apart from the rest of the app, config lets you change environments without touching code and gives one source of truth that all higher layers import.
+**Files in it:** `backend/app/core/config.py` defines the `Settings` class and `get_settings()`; `backend/.env.example` documents every variable; `backend/.env` holds real local values.
+**Depends on:** nothing (it is the bottom).
+**Used by:** Database Core (database URL), Schema Migrations (database URL), and every future layer that needs a secret or setting.
+
+#### Study Notes for this layer
+
+**What is `Settings`?**
+A `pydantic-settings` `BaseSettings` subclass where each attribute is one environment variable with a type and default.
+*Why do we need it?* It validates config at startup — a wrong type or missing required value fails fast instead of crashing later.
+*What breaks without it?* The app has no typed, single place to read config; every module would read `os.environ` on its own.
+*Think of it as:* the settings app on your phone — one place where all preferences live and are checked as valid.
+
+**What is `get_settings`?**
+A function wrapped in `@lru_cache` that builds `Settings()` once and returns the same instance afterward.
+*Why do we need it?* Parsing `.env` and validating is work you only want to do once; caching keeps it cheap and consistent.
+*What breaks without it?* Every import re-reads and re-validates the file, and you can get different instances holding different values.
+*Think of it as:* the restaurant host who greets you once and remembers you, instead of making you re-register every time you walk past.
+
+**What is `ENV_FILE`?**
+A `Path` pointing at `backend/.env`, computed from `config.py`'s own file location (`parents[2]`).
+*Why do we need it?* So `.env` is found no matter which directory you run Python from.
+*What breaks without it?* Alembic (run from `backend/`) and tests (run from elsewhere) could each look in the wrong folder for `.env`.
+*Think of it as:* a fixed home address so mail always arrives at the right door regardless of where the sender is standing.
+
+**What is `_parse_cors_origins`?**
+A `field_validator` that turns the `CORS_ORIGINS` string (`"http://a,http://b"`) into a clean `list[str]`.
+*Why do we need it?* Env vars are strings; CORS needs a list, and hand-editing commas/spaces is error-prone.
+*What breaks without it?* `CORS_ORIGINS` would be a raw string and CORS middleware would get the wrong shape.
+*Think of it as:* a mail sorter who turns one comma-separated envelope into separate labeled letters.
+
+**Why is `SECRET_KEY` the only required field?**
+It has no default, so `Settings()` raises if it is missing; everything else has a sane default.
+*Why do we need it?* Running in dev shouldn't require setting 12 variables, but you must never ship without a signing secret.
+*What breaks without it?* The app silently starts with no/weak signing key for tokens.
+*Think of it as:* a building that lets you in with defaults but insists you bring your own unique master key.
+
+---
+
+### Layer 2: Database Core
+
+**What it is:** The SQLAlchemy engine, the declarative `Base`, the session factory, and the `get_db()` dependency, including SQLite foreign-key enforcement.
+**Why it exists:** It isolates "how we talk to the database" from "what our tables look like" (models) and from HTTP code, so connections and sessions are created the same way everywhere.
+**Files in it:** `backend/app/core/database.py`.
+**Depends on:** Layer 1 (Settings for `DATABASE_URL`).
+**Used by:** Data Models (they subclass `Base`), Schema Migrations (reads `Base.metadata`), and future features that request a session via `get_db()`.
+
+#### Study Notes for this layer
+
+**What is `Base`?**
+The declarative base class (`DeclarativeBase`) that every ORM model inherits from.
+*Why do we need it?* SQLAlchemy discovers all tables and relationships through the metadata attached to `Base`.
+*What breaks without it?* Models can't be declared, and Alembic has no metadata to autogenerate migrations from.
+*Think of it as:* the family name all tables share so the system can find the whole family at once.
+
+**What is `engine`?**
+The object created by `create_engine(settings.DATABASE_URL, ...)` that manages real connections to the database.
+*Why do we need it?* It owns the connection pool and dialect; every session is bound to it.
+*What breaks without it?* Nothing can open a connection; both the app and Alembic are dead in the water.
+*Think of it as:* the phone line to the database — one line, reused for every call.
+
+**What is `SessionLocal`?**
+A configured `sessionmaker` (`autocommit=False`, `autoflush=False`, `expire_on_commit=False`).
+*Why do we need it?* It produces `Session` objects with consistent behavior instead of ad-hoc config per call.
+*What breaks without it?* Sessions would behave differently across modules and reads after commit could surprise you.
+*Think of it as:* a standardized notepad — every request gets a fresh page with the same rules.
+
+**What is `get_db`?**
+A generator dependency that yields a session and always closes it in `finally`.
+*Why do we need it?* FastAPI endpoints will `Depends(get_db)` to get a session and have it cleaned up automatically.
+*What breaks without it?* Connections leak on errors or early returns, slowly exhausting the pool.
+*Think of it as:* a librarian who hands you a book and always takes it back when you leave, even if you rush out.
+
+**What is `_set_sqlite_pragma`?**
+An `event.listens_for(engine, "connect")` hook that runs `PRAGMA foreign_keys=ON` on each SQLite connection.
+*Why do we need it?* SQLite ignores foreign keys by default; without this, `ondelete="CASCADE"` does nothing.
+*What breaks without it?* Deleting a `User` would leave orphaned `email_tokens` and `repos` rows.
+*Think of it as:* flipping the safety switch that SQLite ships turned off.
+
+**Why the `check_same_thread=False` argument?**
+It's only added for SQLite URLs so FastAPI can use a connection across threads.
+*Why do we need it?* SQLite's default is strict about thread ownership, which clashes with async servers.
+*What breaks without it?* You'd get "SQLite objects created in a thread can only be used in that same thread" errors.
+*Think of it as:* unlocking a door that SQLite locks per-thread but the web server needs shared.
+
+---
+
+### Layer 3: Data Models
+
+**What it is:** The SQLAlchemy ORM classes that define the `users`, `email_tokens`, and `repos` tables and their relationships.
+**Why it exists:** Separating the table definitions from the engine and from request schemas keeps the persistence shape in one obvious place.
+**Files in it:** `backend/app/models/user.py` (`User`), `backend/app/models/email_token.py` (`EmailToken`, `EmailTokenType`), `backend/app/models/repo.py` (`Repo`), and `backend/app/models/__init__.py` (re-exports all three + the enum).
+**Depends on:** Layer 2 (`Base`).
+**Used by:** Schema Migrations (metadata for autogenerate) and all future feature/API code.
+
+#### Study Notes for this layer
+
+**What is `User`?**
+The model for a person: `id`, unique indexed `email`, `password_hash`, `is_verified`, and timezone-aware `created_at`.
+*Why do we need it?* It is the anchor record every email token and repo hangs off.
+*What breaks without it?* There is no owner for tokens or repos and no way to authenticate anyone.
+*Think of it as:* the account card at the top of every other document in a filing cabinet.
+
+**What are the `User` relationships?**
+`email_tokens` and `repos` are `relationship(...)` lists with `cascade="all, delete-orphan"` and `passive_deletes=True`.
+*Why do we need it?* They let you reach a user's tokens/repos in Python and define what happens on delete.
+*What breaks without it?* Deleting a user would not clean up children (or would do it inefficiently in Python instead of the DB).
+*Think of it as:* closing your account and having the bank automatically shred all linked statements.
+
+**What is `EmailToken`?**
+A model storing a hashed one-time token per user: `user_id`, `type`, `token_hash` (indexed), `expires_at`, `used_at`.
+*Why do we need it?* Email verification and password reset both need short-lived, single-use tokens.
+*What breaks without it?* Password reset and email verification have nowhere to store/validate their tokens.
+*Think of it as:* a numbered claim ticket you swap for a service, then it's stamped used.
+
+**What is `EmailTokenType`?**
+A `str` enum with `VERIFY = "verify"` and `RESET = "reset"`, stored as a DB enum named `email_token_type`.
+*Why do we need it?* It makes the token's purpose explicit and typo-proof at the DB level.
+*What breaks without it?* Any string could be stored, so a verify flow could accidentally accept a reset token.
+*Think of it as:* color-coded tickets so the staff instantly know which queue you belong in.
+
+**What is `Repo`?**
+A model for a tracked repository: `user_id`, `url`, `owner`, `name`, `status` (default `"added"`), `created_at`, with a `UniqueConstraint("user_id", "url")`.
+*Why do we need it?* It records which repositories a user added so the pipeline can process them.
+*What breaks without it?* Users can't add repos, and the whole product has no input.
+*Think of it as:* a library card listing exactly which books you signed out.
+
+**Why the unique `uq_user_repo_url` constraint?**
+It stops the same user adding the same repo URL twice.
+*Why do we need it?* Duplicate repos would duplicate expensive cloning/indexing work.
+*What breaks without it?* The pipeline would queue the same repo repeatedly.
+*Think of it as:* the bouncer who won't let the same guest enter the same party twice.
+
+**What is `backend/app/models/__init__.py` doing?**
+It imports and re-exports `User`, `EmailToken`, `EmailTokenType`, and `Repo` via `__all__`.
+*Why do we need it?* One import (`import app.models`) registers every model so Alembic sees them all.
+*What breaks without it?* A model not imported anywhere would be invisible to autogenerate and silently missing from migrations.
+*Think of it as:* a team roster posted at the door so nobody gets forgotten.
+
+---
+
+### Layer 4: Schema Migrations (Alembic)
+
+**What it is:** The version-controlled set of database changes, plus the glue that feeds settings and model metadata into Alembic.
+**Why it exists:** So the schema can be created/upgraded/downgraded predictably across machines instead of relying on `create_all()`.
+**Files in it:** `backend/alembic.ini` (config, no hardcoded URL), `backend/alembic/env.py` (wires settings + `Base` + models), `backend/alembic/versions/9dbee76d77e4_create_users_email_tokens_repos.py` (first migration), `backend/alembic/script.py.mako` (template for new migrations), `backend/alembic/README`.
+**Depends on:** Layer 1 (Settings), Layer 2 (`Base`), Layer 3 (models so metadata is populated).
+**Used by:** developers and deploy steps — nothing above it calls it directly.
+
+#### Study Notes for this layer
+
+**What is `env.py`?**
+The script Alembic runs for every command; here it inserts `backend/` on `sys.path`, imports `get_settings`, `Base`, and `app.models`, sets the URL from settings, and sets `target_metadata = Base.metadata`.
+*Why do we need it?* It is the bridge between Alembic and the app's real config and models.
+*What breaks without it?* Alembic wouldn't know the database URL or which tables exist, so migrations would be wrong or empty.
+*Think of it as:* the translator standing between the migration tool and your app, speaking both languages.
+
+**What is `run_migrations_online`?**
+The function that builds a real engine from the config and applies migrations against a live connection.
+*Why do we need it?* Normal `alembic upgrade` runs need an actual database connection.
+*What breaks without it?* You could only ever emit SQL text, never actually change a database.
+*Think of it as:* the builder who actually pours the concrete, not just draws the blueprint.
+
+**What is `run_migrations_offline`?**
+The variant that configures Alembic with just a URL and prints SQL without a DBAPI.
+*Why do we need it?* DBAs sometimes want a SQL script to review or run by hand.
+*What breaks without it?* You lose the ability to generate migration SQL without a reachable database.
+*Think of it as:* a contractor handing you a printed plan you can execute yourself.
+
+**What is `render_as_batch=True`?**
+A setting on `context.configure` that emits "batch" operations for `ALTER TABLE`.
+*Why do we need it?* SQLite can't alter columns normally; batch mode recreates tables and works on Postgres too.
+*What breaks without it?* Column-changing migrations fail on SQLite.
+*Think of it as:* dismantling and rebuilding a LEGO wall to change one brick, because that wall can't be patched in place.
+
+**What is `upgrade()` in the first migration?**
+It creates `users`, `email_tokens`, and `repos` with their columns, indexes, foreign keys (`ondelete="CASCADE"`), the `email_token_type` enum, `uq_user_repo_url`, and server defaults (`is_verified=false`, `status='added'`).
+*Why do we need it?* It is the actual schema the app will run against.
+*What breaks without it?* `alembic upgrade head` produces an empty database and every query fails.
+*Think of it as:* the foundation pour for the whole building.
+
+**Why does `downgrade()` drop tables in reverse order?**
+It drops `repos`, then `email_tokens`, then `users` (and their indexes).
+*Why do we need it?* Foreign keys mean children must go before parents.
+*What breaks without it?* Downgrading would fail on constraint violations and leave the DB half-migrated.
+*Think of it as:* taking down scaffolding from the top, never pulling the bottom beam first.
+
+---
+
+### Layer 5: Repository Pipeline & Deterministic Analysis
+
+**What it is:** The folder skeleton reserved for the deterministic half of the product — cloning repos, chunking, indexing, caching, building a code graph, and the analysis passes (reader order, retrieval, plan checks, context packing).
+**Why it exists:** The design rule is that deterministic analysis decides what is true; the AI only reasons over this evidence. Keeping it separate from `ai/` enforces that.
+**Files in it:** `backend/app/pipeline/{clone,chunking,indexer,cache,graph}/__init__.py`, `backend/app/analysis/{reader_order,retrieval,plan_checks,packer}/__init__.py`, and `backend/app/tasks/__init__.py`.
+**Depends on:** Layer 1 (settings), Layer 2 (sessions), Layer 3 (models, e.g. `Repo`).
+**Used by:** the future AI Layer (as evidence) and the future HTTP API (to trigger and report status).
+
+*Not implemented yet. Every file listed is an empty `__init__.py` package marker.*
+
+#### Study Notes for this layer
+
+**What is `pipeline/clone`?**
+Reserved for cloning a repo's code to local disk.
+*Why do we need it?* Everything downstream needs a local copy to read.
+*What breaks without it?* Nothing to index or analyze.
+*Think of it as:* the delivery truck bringing the package to the warehouse.
+
+**What is `pipeline/chunking`?**
+Reserved for splitting source files into analyzable chunks.
+*Why do we need it?* You can't embed or search whole repos at once.
+*What breaks without it?* Downstream code has no unit of content to index.
+*Think of it as:* cutting a long document into index cards.
+
+**What is `pipeline/indexer`?**
+Reserved for building the searchable index over the cloned code.
+*Why do we need it?* Retrieval needs a persistent index to look things up fast.
+*What breaks without it?* Every query would have to re-read raw files.
+*Think of it as:* the back-of-the-book index so you don't re-read every page.
+
+**What is `pipeline/cache`?**
+Reserved for caching clones and index artifacts.
+*Why do we need it?* Re-cloning and re-indexing the same repo is slow and wasteful.
+*What breaks without it?* Repeat runs are needlessly expensive.
+*Think of it as:* keeping leftovers in the fridge instead of cooking from scratch each time.
+
+**What is `pipeline/graph`?**
+Reserved for building a graph of code structure/dependencies.
+*Why do we need it?* Understanding how files and symbols relate needs a graph, not a flat list.
+*What breaks without it?* Analysis loses the connections between code pieces.
+*Think of it as:* a subway map instead of a list of station names.
+
+**What is `analysis/reader_order`?**
+Reserved for deciding which files a reader should look at first.
+*Why do we need it?* A newcomer needs a sensible reading path through a codebase.
+*What breaks without it?* Output would be an unsorted pile of files.
+*Think of it as:* a table of contents ordered by importance.
+
+**What is `analysis/retrieval`?**
+Reserved for pulling the exact evidence (with file:line) for a question.
+*Why do we need it?* The design rule says every claim must cite real code.
+*What breaks without it?* The AI would have nothing grounded to reason over.
+*Think of it as:* a court clerk fetching the exact documents a lawyer asked for.
+
+**What is `analysis/plan_checks`?**
+Reserved for deterministic checks against a plan.
+*Why do we need it?* Some truths are checkable without any AI.
+*What breaks without it?* Plan verification would rely entirely on the model.
+*Think of it as:* a spell-checker that catches obvious errors before an editor reads it.
+
+**What is `analysis/packer`?**
+Reserved for packing selected evidence into a bounded context for the AI.
+*Why do we need it?* Models have token limits; you must choose what fits.
+*What breaks without it?* You'd overflow the prompt or send irrelevant code.
+*Think of it as:* packing only the essentials into a carry-on bag.
+
+**What is `tasks`?**
+Reserved for background jobs (e.g. running the pipeline out-of-band).
+*Why do we need it?* Cloning/indexing is slow and shouldn't block HTTP requests.
+*What breaks without it?* Long operations would tie up the request cycle.
+*Think of it as:* the kitchen queue ticket, separate from the waiter taking orders.
+
+---
+
+### Layer 6: AI Layer
+
+**What it is:** The folder skeleton reserved for the LLM side — embeddings, prompt templates, model routing, and the agent/tool loop.
+**Why it exists:** The design rule says the AI only retrieves, reasons over evidence, and explains; keeping it isolated makes that boundary explicit and lets the rest of the app work when the AI is unavailable.
+**Files in it:** `backend/app/ai/embeddings/__init__.py`, `backend/app/ai/prompts/__init__.py`, `backend/app/ai/router/__init__.py`, `backend/app/agent/__init__.py`, and `backend/app/agent/router.py` (the `GET /repos/{repo_id}/agent/trace` stub).
+**Depends on:** Layer 5 (deterministic evidence) — by design it must not invent facts on its own.
+**Used by:** the future HTTP API.
+
+*Not implemented yet. The `ai/` files are empty `__init__.py` markers; `agent/router.py` only registers the `501` trace stub.*
+
+#### Study Notes for this layer
+
+**What is `ai/embeddings`?**
+Reserved for turning code/text into vectors for semantic search.
+*Why do we need it?* Vector search complements keyword/graph retrieval.
+*What breaks without it?* Semantic queries fall back to exact matching only.
+*Think of it as:* translating sentences into coordinates so similar ideas sit near each other.
+
+**What is `ai/prompts`?**
+Reserved for the prompt templates sent to the model.
+*Why do we need it?* Prompts should be versioned and reused, not scattered in code strings.
+*What breaks without it?* Prompt changes are untracked and inconsistent.
+*Think of it as:* a recipe card the whole kitchen follows.
+
+**What is `ai/router`?**
+Reserved for choosing which model/provider handles a request.
+*Why do we need it?* Different tasks cost and perform differently across models.
+*What breaks without it?* Hardcoding one model with no fallback.
+*Think of it as:* a dispatcher sending each call to the best-suited operator.
+
+**What is `agent`?**
+Reserved for the loop where the model calls tools over retrieved evidence.
+*Why do we need it?* Multi-step reasoning needs a controller, not one-shot prompts.
+*What breaks without it?* Only single-shot answers would be possible.
+*Think of it as:* a researcher who keeps consulting the library until the question is answered.
+
+---
+
+### Layer 7: Features & HTTP API
+
+**What it is:** The folder skeleton for the FastAPI application: the app object, request/response schemas, security helpers, and the per-feature route modules.
+**Why it exists:** It is the top edge the outside world talks to; keeping endpoints grouped by feature keeps routing readable as the app grows.
+**Files in it:** `backend/app/main.py` (the app factory, CORS, global error handlers, rate-limit handler, and `GET /health` plus the `GET /evals` stub), `backend/app/core/email.py` (SMTP sending with a dev console fallback, and verification/reset email helpers), `backend/app/core/ratelimit.py` (the slowapi `Limiter`), `backend/app/schemas/{__init__,common,auth,repo,stub}.py` (the Pydantic request/response models), `backend/app/security/{__init__,passwords,tokens,email_tokens}.py` (password hashing, JWT, email-token helpers), `backend/app/features/auth/{__init__,dependencies,router}.py` (the complete auth feature), `backend/app/features/repos/{__init__,dependencies,router}.py` (the repo-records feature plus the shared `get_owned_repo` dependency), and the Part 2–4 stub routers `backend/app/features/{indexing,plan,reader,context}/router.py` and `backend/app/agent/router.py`.
+**Depends on:** Layers 1–4 (config, DB, models, migrations) and, once built, Layers 5–6.
+**Used by:** the frontend and any external client.
+
+*Part 1 is complete on the backend. `main.py` defines the app, `GET /health`, the rate-limit handling and the `GET /evals` stub, `schemas/` defines all Part 1 models plus the documented contract, `security/` implements password hashing, JWT and email-token helpers, `core/email.py` sends mail, `core/ratelimit.py` provides the limiter, `features/auth/` implements every Part 1 auth endpoint, `features/repos/` implements repo CRUD, and the Part 2–4 routers register every remaining endpoint as an ownership-checked `501` stub. The deterministic pipeline, analysis and AI layers above are still empty `__init__.py`.*
+
+#### Study Notes for this layer
+
+**What is `backend/app/main.py`?**
+The FastAPI app factory (`create_app()`) plus the module-level `app = create_app()` that uvicorn imports as `app.main:app`.
+*Why do we need it?* It builds the ASGI application, attaches CORS, the rate limiter and error handling, registers `GET /health` and `GET /evals`, and mounts the auth, repos and stub routers.
+*What breaks without it?* There is no server to run; `uvicorn app.main:app` cannot start.
+*Think of it as:* the front door of the building — it now exists and opens.
+
+**Why `create_app()` as a factory instead of a bare `app`?**
+It builds and configures a fresh `FastAPI` instance and returns it, with `app = create_app()` at module level for uvicorn.
+*Why do we need it?* Settings, middleware and handlers are applied in one obvious place, and tests can build isolated app instances.
+*What breaks without it?* Configuration would be scattered at import time with no clean seam to build or test the app.
+*Think of it as:* a recipe for assembling the store before opening, rather than a pre-built store you can't rearrange.
+
+**What is the CORS middleware doing here?**
+`add_middleware(CORSMiddleware, ...)` with `allow_origins=settings.CORS_ORIGINS` (plus all methods/headers and credentials).
+*Why do we need it?* The browser frontend is served from a different origin and needs the API to permit it.
+*What breaks without it?* The frontend's requests are blocked by the browser's same-origin policy.
+*Think of it as:* a guest list at the door naming exactly which websites may call in.
+
+**What are the global exception handlers?**
+Handlers for `RequestValidationError` (422), `StarletteHTTPException` (its status code), `RateLimitExceeded` (429), and `Exception` (500), all returning `{"error": {"code", "message", "details"?}}`.
+*Why do we need it?* Every error — including rate limiting — leaves the API in one consistent JSON shape instead of FastAPI's default `{"detail": ...}` or a raw traceback.
+*What breaks without it?* Clients would parse several error formats, and unhandled errors could leak internals (the unhandled handler logs the traceback server-side and returns only a generic message).
+*Think of it as:* a single standardized complaint form every department must use.
+
+**What is `GET /health`?**
+A dependency-free route returning `{"status": "ok"}`.
+*Why do we need it?* Load balancers, uptime checks and the team need a cheap liveness probe.
+*What breaks without it?* You can't tell at a glance whether the process is up.
+*Think of it as:* a doorman answering "yes, we're open" without walking you through the building.
+
+**What is `features/auth`?**
+The complete Part 1 auth feature: `router.py` implements `POST /auth/signup`, `POST /auth/verify-email`, `POST /auth/resend-verification`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `POST /auth/forgot-password`, `POST /auth/reset-password`, `POST /auth/change-password`, `DELETE /auth/account`, and `GET /auth/me`; `dependencies.py` provides the `get_current_user` dependency.
+*Why do we need it?* Users need accounts, and the `User`/`EmailToken` models exist to support this.
+*What breaks without it?* No one can register or log in.
+*Think of it as:* the reception desk that issues your badge.
+
+**What does the auth `router.py` do?**
+It exposes the auth endpoints on an `APIRouter(prefix="/auth")`. Signup normalizes the email to lowercase, rejects duplicates (409), hashes the password, stores an unverified `User`, creates a `VERIFY` email token and sends the verification link. `verify-email` looks up the token by its hash and rejects invalid/expired/used tokens (400) before marking the user verified and the token used. `resend-verification` always returns the same 200 message (no account enumeration) and only sends when the account exists and is unverified, invalidating older unused verify tokens. `login` checks the password (401 on mismatch) and blocks unverified users (403) before issuing access + refresh tokens. `refresh` accepts only a refresh token (an access token is rejected 401), re-checks that the user still exists and is verified, and returns a new pair. `logout` confirms success but is client-side only (no revocation table). `forgot-password` always returns the same 200 message, and only for an existing user creates a single-use `RESET` token and sends the email in the background. `reset-password` validates a valid/unexpired/unused `RESET` token, applies the password rule, sets the new hash and stamps `used_at`. `change-password` verifies the current password, rejects reusing the old password, and sets the new hash. `delete-account` deletes the user (cascading to tokens and repos). `/auth/me` returns the current user.
+*Why do we need it?* It is the concrete account lifecycle the rest of the app is gated behind.
+*What breaks without it?* Accounts can't be created, recovered, or managed, so nothing downstream can be owned by a user.
+*Think of it as:* the reception desk that checks your ID, issues your badge, hands out reprints, and shreds your file when you leave.
+
+**What is `get_current_user`?**
+A FastAPI dependency in `features/auth/dependencies.py` that reads the `Authorization: Bearer <access_token>` header, decodes it as an access token via `decode_token`, loads the `User` by the token's subject, and returns it — raising a 401 `"Not authenticated"` for a missing, malformed, expired, wrong-type token or unknown user.
+*Why do we need it?* Protected routes (`/auth/me`, `/auth/logout`, `/auth/change-password`, `/auth/account`, and later repos) need one shared, tested way to turn a header into a user.
+*What breaks without it?* Every protected endpoint would re-implement token parsing and could drift or leak different errors.
+*Think of it as:* the bouncer who checks your wristband and lets you in as the person it names.
+
+**What is `core/email.py`?**
+The email service: `send_email()` sends via SMTP (`SMTP_HOST`/`SMTP_PORT`/`SMTP_USER`/`SMTP_PASSWORD`/`EMAIL_FROM`), or, when `SMTP_HOST` is unset, logs the message to the console instead of sending (the dev fallback). `verification_link()`/`send_verification_email()` build and send the verification message; `reset_link()`/`send_reset_email()` do the same for password reset (links point at `FRONTEND_URL`).
+*Why do we need it?* Signup, resend and forgot-password must deliver links, but local dev has no mail server.
+*What breaks without it?* Emails can't be sent, and these flows can't be tested locally without real SMTP credentials.
+*Think of it as:* the mailroom — it posts letters when the post office is configured, and otherwise reads them aloud so you can still act.
+
+**What is `core/ratelimit.py`?**
+A slowapi `Limiter(key_func=get_remote_address)` that keys limits by client IP. The auth router decorates signup, login, forgot-password and resend-verification with `@limiter.limit(lambda: get_settings().RATE_LIMIT_*)`, and `main.py` attaches the limiter to `app.state.limiter` and registers a `RateLimitExceeded` handler that returns the standard 429 `http_error` `"Too many requests"` envelope. Limits come from `RATE_LIMIT_*` settings and are read per request.
+*Why do we need it?* Login/signup/forgot/resend are the endpoints most abused for password guessing and email spam.
+*What breaks without it?* Brute-force and enumeration attempts are unthrottled.
+*Think of it as:* a turnstile that only lets each visitor through a few times a minute.
+
+**What is `features/repos`?**
+The complete repo-records feature: `router.py` implements `POST /repos`, `GET /repos`, `GET /repos/{repo_id}`, and `DELETE /repos/{repo_id}`, all requiring a logged-in user, and `dependencies.py` provides the shared `get_owned_repo` dependency.
+*Why do we need it?* It is how a `Repo` row gets created so the pipeline has work.
+*What breaks without it?* Users can't submit, view or remove repos, so nothing downstream ever runs.
+*Think of it as:* the intake form at the front desk, plus the drawer where your submitted forms are kept.
+
+**What does the repos `router.py` do?**
+It exposes the four repo endpoints on an `APIRouter(prefix="/repos", tags=["repos"])`, each depending on `features/auth/dependencies.get_current_user`. `create` takes a `RepoCreate`, re-parses the URL with `parse_github_url`, lowercases `owner`/`name`/`url` (GitHub is case-insensitive), rejects a duplicate for the same user with 409 (checked in code and again via the `uq_user_repo_url` constraint on `IntegrityError`), and inserts a `Repo` with `status="added"`. `list` returns only the current user's rows newest first as `RepoListOut`. `get` and `delete` depend on `get_owned_repo`, so a repo that belongs to another user and a repo that does not exist both return the same 404 and ids cannot be probed. No network call and no cloning happen here — that is Part 2.
+*Why do we need it?* It is the whole "save a link" half of Part 1 and the only source of `Repo` rows.
+*What breaks without it?* There is no way to give the pipeline a repository.
+*Think of it as:* a librarian who records the book you hand over, lists only your shelf, and won't let you pull someone else's book.
+
+**What is `get_owned_repo`?**
+A FastAPI dependency in `features/repos/dependencies.py` that depends on `get_current_user` and `get_db`, loads the `Repo` where `id == repo_id` **and** `user_id == current_user.id`, and returns it — or raises 404 `"Repo not found"` for a missing row or one owned by someone else. The repos `get`/`delete` routes and every repo-scoped stub reuse it.
+*Why do we need it?* Ownership-scoped lookups appear in many endpoints; centralizing the "mine only, same 404 either way" rule prevents it from drifting and stops id probing.
+*What breaks without it?* Each endpoint would repeat the query and could leak whether a foreign repo exists.
+*Think of it as:* the librarian's rule — if the card isn't on your shelf, it simply doesn't exist to you.
+
+**What is `features/plan`?**
+Part 3's plan feature; for now a stub router (`router.py`) exposing `POST /repos/{repo_id}/plan` (accepts a multipart YAML file) and `GET /repos/{repo_id}/plan`, both returning `501 {"status": "not_implemented"}` after verifying the repo belongs to the caller.
+*Why do we need it?* It reserves the plan endpoints so the frontend can wire them now.
+*What breaks without it?* The frontend would have no plan routes to call, not even placeholders.
+*Think of it as:* a meeting room that is booked and labelled but has no furniture yet.
+
+**What is `features/indexing`?**
+Part 2's indexing feature; for now a stub router exposing `POST /repos/{repo_id}/index`, `GET .../index/status`, and `GET .../index/summary`, all `501` after an ownership check.
+*Why do we need it?* It reserves the pipeline endpoints the frontend polls.
+*What breaks without it?* There is no route to start or watch indexing.
+*Think of it as:* a washing-machine button that is installed but not wired to the machine.
+
+**What is `features/context`?**
+Part 3's context/query feature; for now a stub router exposing `POST /repos/{repo_id}/context` and `POST /repos/{repo_id}/query` (each a JSON `StubQueryRequest` of `{query, mode}`), returning `501` after an ownership check.
+*Why do we need it?* It reserves the context-packing and intent-router endpoints.
+*What breaks without it?* Packed context and query routing have no entry points.
+*Think of it as:* a service window that is built but has nothing on the counter yet.
+
+**What is `features/reader`?**
+Part 3's reader feature; for now a stub router exposing `GET /repos/{repo_id}/reader`, returning `501` after an ownership check.
+*Why do we need it?* It reserves the reading-order endpoint.
+*What breaks without it?* Reading-order output has no route to be requested.
+*Think of it as:* a guided-tour desk that is staffed but has no itinerary yet.
+
+**What is `schemas`?**
+The Pydantic request/response models for the API: `common.py` (error/message envelopes), `auth.py` (auth requests, `TokenResponse`, `UserOut`, password rule), `repo.py` (`RepoCreate`/`RepoOut`/`RepoListOut`, GitHub URL parsing), `stub.py` (`StubQueryRequest` = `{query, mode}` for the Part 3 stub endpoints), re-exported from `__init__.py`.
+*Why do we need it?* ORM models must not leak straight to the API; schemas validate input and shape output.
+*What breaks without it?* No input validation or response contracts.
+*Think of it as:* customs forms that standardize what can cross the border.
+
+**What is `ErrorResponse` / `MessageResponse`?**
+`ErrorResponse` mirrors the app's error envelope (`{"error": {"code", "message", "details?"}}`); `MessageResponse` is a simple `{"message": str}` for confirmations.
+*Why do we need it?* They pin the one error shape the handlers in `main.py` already emit and give simple successes a type.
+*What breaks without it?* The error contract would live only in handler code, and responses would be untyped.
+*Think of it as:* the standard complaint form and the standard receipt.
+
+**What is the password rule?**
+`validate_password_strength` (min 8 chars, at least one letter and one digit) applied to `SignupRequest`, `ResetPasswordRequest.new_password`, and `ChangePasswordRequest.new_password`.
+*Why do we need it?* Same rule server-side and in the contract, so the frontend can mirror it.
+*What breaks without it?* Weak or inconsistent passwords would pass validation.
+*Think of it as:* a minimum bar on the door to the club.
+
+**What is `RepoCreate` doing?**
+It takes only `url`, validates it is a public `github.com/owner/name` URL (accepting missing scheme, `www.`, trailing slash, `.git`), normalizes it to `https://github.com/owner/name`, and exposes `owner`/`name` as parsed properties.
+*Why do we need it?* The client sends a link; the server derives owner/name and rejects non-GitHub links.
+*What breaks without it?* Any string could be stored as a repo and owner/name parsing would be duplicated.
+*Think of it as:* a form that only accepts library addresses and automatically fills in the branch and shelf.
+
+**What are `RepoOut` / `RepoListOut`?**
+`RepoOut` is the wire shape of a repo (`id`, `url`, `owner`, `name`, `status`, `created_at`, `from_attributes=True`); `RepoListOut` wraps a list as `{"repos": [...]}`.
+*Why do we need it?* It hides `user_id` and lets list and detail responses stay consistent objects.
+*What breaks without it?* Internal columns leak and lists have no envelope to grow into.
+*Think of it as:* the display card for a repo, and a folder that holds the cards.
+
+**What is `security`?**
+The security helpers: `passwords.py` (`hash_password`, `verify_password` via argon2), `tokens.py` (`create_access_token`, `create_refresh_token`, `decode_token` via PyJWT), and `email_tokens.py` (`generate_email_token`, `hash_token`, `expires_at`, `is_expired`, `is_used`), re-exported from `__init__.py`.
+*Why do we need it?* Auth endpoints need safe password hashing, short-lived access/refresh JWTs, and single-use emailed tokens — all in one tested place rather than inline in routes.
+*What breaks without it?* Auth logic would be duplicated and error-prone, and tokens/passwords could be handled unsafely.
+*Think of it as:* the vault where keys are made, checked and revoked.
+
+**What is `hash_password` / `verify_password`?**
+`hash_password` returns an argon2 encoded hash (never the plain password); `verify_password` re-hashes and compares, returning `False` on mismatch or a malformed hash instead of raising.
+*Why do we need it?* Passwords are never stored or logged in plain text.
+*What breaks without it?* Passwords would be stored insecurely or verification would throw on bad input.
+*Think of it as:* a one-way stamp you can check but never read back.
+
+**What is `create_access_token` / `create_refresh_token` / `decode_token`?**
+JWTs signed with `SECRET_KEY` (HS256). Access tokens carry `type="access"` and a short `exp`; refresh tokens carry `type="refresh"` and a longer `exp`. `decode_token(token, expected_type)` verifies the signature and expiry and enforces the type, raising `TokenError` otherwise.
+*Why do we need it?* An access token must not be usable as a refresh token (or vice versa); type checking prevents that.
+*What breaks without it?* A stolen/refreshed token could be replayed in the wrong role.
+*Think of it as:* two differently-colored wristbands — valid only for their own door.
+
+**What are the email-token helpers?**
+`generate_email_token()` returns `(raw_token, token_hash)` using `secrets.token_urlsafe`; only `token_hash` (SHA-256 hex) is stored in `email_tokens`. `expires_at(type)` gives the lifetime (verify: `VERIFY_TOKEN_EXPIRE_HOURS`, reset: `RESET_TOKEN_EXPIRE_MINUTES`); `is_expired`/`is_used` check the stored timestamps.
+*Why do we need it?* Verification and reset links must be single-use and time-limited, and the DB must never hold the raw link token.
+*What breaks without it?* Links would be long-lived/reusable, and a DB leak would expose working links.
+*Think of it as:* a numbered claim ticket — the stub is checked against the stored copy and expires.
+
+**What are `TokenType` and `TokenError`?**
+`TokenType` is the `access`/`refresh` enum embedded in each JWT; `TokenError` is the single exception `decode_token` raises for expired, tampered, wrong-secret, or wrong-type tokens.
+*Why do we need it?* Callers get one predictable error type from `decode_token`.
+*What breaks without it?* Every caller would have to catch several PyJWT exception classes.
+*Think of it as:* one error siren for all bad-token cases.
+
+---
+
+### Layer 8: Frontend
+
+**What it is:** The reserved folder for the browser UI.
+**Why it exists:** To keep client code out of the backend and let the API stay headless.
+**Files in it:** `frontend/.gitkeep` only.
+**Depends on:** Layer 7 (HTTP API).
+**Used by:** end users.
+
+*Not implemented yet. The folder contains only a `.gitkeep`; `.gitignore` already anticipates Node/Next/Vite artifacts (`node_modules/`, `.next/`, `.vite/`).*
+
+#### Study Notes for this layer
+
+**What is `frontend/`?**
+The planned home of the web client.
+*Why do we need it?* Humans need a UI, not raw JSON.
+*What breaks without it?* There is no visual way to use the product.
+*Think of it as:* the showroom floor; the factory (API) works without it, but customers can't browse.
+
+---
+
+### Layer 9: Supporting Tooling (Docker, Evals, Scripts)
+
+**What it is:** Local orchestration, evaluation harness, and helper scripts.
+**Why it exists:** These support the runtime without being part of the runtime dependency chain.
+**Files in it:** `docker/docker-compose.yml` (empty), `evals/` (folders for agent, context_packer, data, plan_verifier — all `.gitkeep` only), `scripts/.gitkeep`.
+**Depends on:** the layers it wraps/tests (any).
+**Used by:** developers and CI.
+
+*Not implemented yet. `docker/docker-compose.yml` is empty and there is no Dockerfile. `evals/` and `scripts/` hold only `.gitkeep` files.*
+
+#### Study Notes for this layer
+
+**What is `docker/docker-compose.yml`?**
+A placeholder for running the stack via Docker Compose.
+*Why do we need it?* Consistent local/dev environments.
+*What breaks without it?* You run everything manually.
+*Think of it as:* a shipping container that packages the whole app.
+
+**What is `evals/`?**
+The planned home for evaluation harnesses (agent, context packer, plan verifier) and eval data.
+*Why do we need it?* It measures quality outside the app package.
+*What breaks without it?* No repeatable way to judge output quality.
+*Think of it as:* a test kitchen separate from the restaurant.
+
+**What is `scripts/`?**
+The planned home for one-off helper scripts.
+*Why do we need it?* Keeps ad-hoc tooling out of the app code.
+*What breaks without it?* Helpers get scattered and duplicated.
+*Think of it as:* the toolbox in the garage.
+
+---
+
+## The Full Flow
+
+Two things actually run end to end right now: applying the database schema and serving a minimal HTTP API. First, here is exactly what happens when you run `alembic upgrade head` from `backend/` with the venv active:
+
+1. **Entry (Layer 4).** The `alembic` CLI reads `backend/alembic.ini`, sees `script_location = %(here)s/alembic`, and loads `backend/alembic/env.py`.
+2. **Wiring (Layer 4 -> 1/2/3).** `env.py` inserts `backend/` into `sys.path`, then imports `get_settings` (Layer 1), `Base` (Layer 2) and `app.models` (Layer 3). Importing `app.models` runs `models/__init__.py`, which imports `User`, `EmailToken`, `EmailTokenType`, and `Repo`, registering all three tables on `Base.metadata`.
+3. **Config (Layer 1).** `get_settings()` reads `backend/.env`, validates it into a cached `Settings`, and returns `DATABASE_URL = "sqlite:///./repotrackr.db"`.
+4. **URL + metadata (Layer 4).** `env.py` calls `config.set_main_option("sqlalchemy.url", ...)` with that URL and sets `target_metadata = Base.metadata`.
+5. **Engine (Layer 4 -> 2).** `run_migrations_online()` builds an engine via `engine_from_config` and connects.
+6. **Migration (Layer 4).** Alembic compares `alembic_version` against the revision chain and runs `upgrade()` in `9dbee76d77e4_create_users_email_tokens_repos.py`, which issues `CREATE TABLE` for `users`, `email_tokens`, and `repos`, plus indexes, foreign keys, the `email_token_type` enum, `uq_user_repo_url`, and defaults.
+7. **Output.** `backend/repotrackr.db` now exists with those tables (and `alembic_version`). `alembic check` then reports "No new upgrade operations detected" because the models match the migration.
+
+```
+You
+ │  `alembic upgrade head` (from backend/, venv active)
+ ▼
+alembic.ini ────────► alembic/env.py
+                         │  imports
+                         ├─► app.core.config.get_settings()   [Layer 1]  reads .env
+                         ├─► app.core.database.Base           [Layer 2]  engine/Base
+                         └─► app.models                       [Layer 3]  User/EmailToken/Repo
+                         │
+                         ▼
+                 run_migrations_online()
+                         │  engine_from_config(sqlalchemy.url)
+                         ▼
+     versions/9dbee76d77e4_...upgrade()  [Layer 4]
+                         │  CREATE TABLE users / email_tokens / repos
+                         ▼
+              backend/repotrackr.db  (3 tables + alembic_version)
+```
+
+### HTTP request flow (app factory)
+
+When uvicorn imports `app.main:app`, the module builds the app, mounts the auth and repos routers, and serves requests:
+
+1. **Startup (Layer 7).** `uvicorn app.main:app` imports `backend/app/main.py`, which calls `create_app()` and assigns `app = create_app()`.
+2. **Config (Layer 1).** `create_app()` calls `get_settings()`, which reads `backend/.env` into the cached `Settings`.
+3. **Middleware + handlers (Layer 7).** It builds the `FastAPI` object, sets `app.state.limiter`, adds `CORSMiddleware` using `settings.CORS_ORIGINS`, registers the exception handlers (including the 429 rate-limit handler), and calls `app.include_router(...)` for the auth, repos, indexing, plan, reader, context and agent routers to mount `features/*/router.py` and `agent/router.py`. `GET /evals` is declared directly on the app.
+4. **Request (`GET /health`).** The route returns `{"status": "ok"}`.
+5. **Errors.** A validation error returns 422, an HTTP error (e.g. unknown path -> 404) returns its own status code, a rate-limit breach returns 429, and any unhandled error returns 500 — all in the same `{"error": {"code", "message", ...}}` shape.
+
+```
+Browser ──GET /health──► uvicorn ──► app/main.py:app
+                                      │ CORS + exception handlers + limiter
+                                      ▼
+                                    200 {"status":"ok"}
+```
+
+### Auth request flow (signup -> verify -> login -> reset)
+
+The auth feature ties Layers 1–4 and 7 together:
+
+1. **Signup (Layer 7).** `POST /auth/signup` validates the body (`SignupRequest`, 422 on a weak password), rejects an existing email (409), hashes the password (`security.hash_password`), inserts an unverified `User` (Layers 2–3, `get_db()`), creates a `VERIFY` `EmailToken` storing only `security.hash_token(raw)` with `security.expires_at("verify")`, then calls `core/email.send_verification_email(email, raw)`. With `SMTP_HOST` set it sends via SMTP; otherwise it logs the link to the console. This endpoint (and forgot-password/resend/login) passes through the `@limiter.limit` check first (429 when exceeded).
+2. **Verify (Layer 7).** `POST /auth/verify-email` hashes the submitted token, looks up the matching `VERIFY` `EmailToken`, and rejects it with 400 when missing, used (`is_used`) or expired (`is_expired`). On success it stamps `used_at` and sets the user's `is_verified = True`.
+3. **Login (Layer 7).** `POST /auth/login` loads the user by normalized email, checks the password with `security.verify_password` (401 on mismatch), returns 403 while unverified, and otherwise returns `TokenResponse` with `create_access_token(user.id)` and `create_refresh_token(user.id)`.
+4. **Refresh (Layer 7).** `POST /auth/refresh` decodes the submitted token as a refresh token (an access token fails), confirms the user still exists and is verified, and returns a fresh pair.
+5. **Me / protected routes (Layer 7).** `GET /auth/me` (and `logout`, `change-password`, `DELETE /account`) depend on `features/auth/dependencies.get_current_user`, which decodes the Bearer access token and loads the user.
+6. **Forgot / reset (Layer 7).** `POST /auth/forgot-password` always returns the same 200 message; for an existing user it creates a single-use `RESET` token and schedules `core/email.send_reset_email` as a background task. `POST /auth/reset-password` validates the token (valid/unexpired/unused/type reset), applies the password rule, sets the new hash and stamps `used_at`.
+
+```
+Browser ──POST /auth/signup──► app/main.py:app ──► features/auth/router.py
+   201 {message}                                   │ limiter check -> hash pw, save User (get_db)
+                                                   │ store EmailToken(hash, exp)
+                                                   ▼
+                                     core/email.send_verification_email
+                                        (SMTP, else console)
+Browser ──POST /auth/verify-email──► router ──► mark token used + user verified
+Browser ──POST /auth/login───────► router ──► 200 {access_token, refresh_token}
+Browser ──POST /auth/refresh─────► router ──► 200 {access_token, refresh_token}
+Browser ──POST /auth/forgot-password─► router ──► 200 {message} (+ background reset email)
+Browser ──POST /auth/reset-password──► router ──► 200 {message} (token used, pw changed)
+Browser ──GET /auth/me (Bearer)──► router ──► dependencies.get_current_user ──► 200 UserOut
+```
+
+### Repos request flow (add -> list -> get -> delete)
+
+The repo feature reuses the auth `get_current_user` dependency and the `repos` table (Layers 2–3) and never touches GitHub:
+
+1. **Add (Layer 7).** `POST /repos` authenticates the Bearer token (`get_current_user`), validates the body as `RepoCreate` (`parse_github_url` rejects anything that is not `github.com/owner/name` with 422), lowercases `owner`/`name`/`url`, and rejects a duplicate for that user with 409. Otherwise it inserts a `Repo(user_id, url, owner, name, status="added")`.
+2. **List (Layer 7).** `GET /repos` returns the current user's rows newest first as `RepoListOut({"repos": [...]})`.
+3. **Get / delete (Layer 7).** `GET /repos/{repo_id}` and `DELETE /repos/{repo_id}` look the row up by `id` **and** `user_id`; a missing row or another user's row returns the same 404. Delete returns `{"message": "Repo deleted."}`.
+
+```
+Browser ──POST /repos (Bearer)──► app/main.py:app ──► features/repos/router.py
+   201 RepoOut                     │ get_current_user -> parse_github_url
+                                   │ lowercase -> duplicate? 409
+                                   ▼
+                        insert Repo(status="added") via get_db()
+Browser ──GET /repos (Bearer)────► router ──► 200 RepoListOut (only my rows, newest first)
+Browser ──GET /repos/{id}────────► router ──► 200 RepoOut | 404 (mine only)
+Browser ──DELETE /repos/{id}─────► router ──► 200 {message} | 404 (mine only)
+```
+
+### Stub request flow (Parts 2–4)
+
+Every Part 2–4 endpoint is registered but not implemented, so the frontend can wire it now and get realistic behavior:
+
+1. **Repo-scoped stubs (Layer 7).** `POST /repos/{repo_id}/index`, `GET .../index/status`, `GET .../index/summary`, `POST`/`GET /repos/{repo_id}/plan`, `GET /repos/{repo_id}/reader`, `POST /repos/{repo_id}/context`, `POST /repos/{repo_id}/query`, and `GET /repos/{repo_id}/agent/trace` each depend on `features/repos/dependencies.get_owned_repo` (so a missing token is 401 and a foreign/missing repo is the same 404) and then return `501 {"status": "not_implemented"}`.
+2. **Evals stub (Layer 7).** `GET /evals` is public (no auth, no repo) and also returns `501 {"status": "not_implemented"}`.
+
+```
+Browser ──POST /repos/{id}/index (Bearer)──► app/main.py:app ──► features/indexing/router.py
+                                                │ get_owned_repo: 401 / 404 / else
+                                                ▼
+                                     501 {"status": "not_implemented"}
+```
+
+## Current Status
+
+Working now (built and previously verified, see `docs/changes.md`):
+- Settings & Configuration (`app/core/config.py`, `backend/.env`, `backend/.env.example`).
+- Database Core (`app/core/database.py`).
+- Data Models (`app/models/user.py`, `email_token.py`, `repo.py`, `__init__.py`).
+- Schema Migrations — `alembic.ini`, `alembic/env.py`, and the first migration creating `users`, `email_tokens`, `repos`.
+- HTTP API app factory (`app/main.py`): `create_app()`, CORS from `CORS_ORIGINS`, the slowapi limiter + 429 handler, global JSON error handlers, `GET /health`, and the `GET /evals` stub; runnable via `uvicorn app.main:app`.
+- Auth feature (`app/features/auth/router.py`, `app/features/auth/dependencies.py`): `POST /auth/signup`, `POST /auth/verify-email`, `POST /auth/resend-verification`, `POST /auth/login`, `POST /auth/refresh`, `POST /auth/logout`, `POST /auth/forgot-password`, `POST /auth/reset-password`, `POST /auth/change-password`, `DELETE /auth/account`, and `GET /auth/me`, mounted in `main.py`.
+- Rate limiting (`app/core/ratelimit.py`, slowapi): per-IP limits on signup, login, forgot-password and resend-verification, configurable via `RATE_LIMIT_*`, returning 429 `http_error`.
+- Repo-records feature (`app/features/repos/router.py`, `dependencies.py`): `POST /repos`, `GET /repos`, `GET /repos/{repo_id}`, and `DELETE /repos/{repo_id}`, all auth-required and scoped to the current user; new repos get `status="added"`, duplicates per user (case-insensitive) return 409, and another user's or a missing repo returns the same 404.
+- Part 2–4 stubs (`app/features/{indexing,plan,reader,context}/router.py`, `app/agent/router.py`, `GET /evals`): all 10 documented not-yet-implemented endpoints are registered. Repo-scoped ones verify ownership via `get_owned_repo` (401 / 404) and then return `501 {"status": "not_implemented"}`; `/evals` is public.
+- Email service (`app/core/email.py`): SMTP sending via `SMTP_*`/`EMAIL_FROM` with a console fallback when `SMTP_HOST` is unset, plus verification/reset link and email helpers.
+- Request/response schemas (`app/schemas/{common,auth,repo,stub}.py`) and the documented contract (`docs/api_contract.md`, `docs/mock_responses.md`, `docs/openapi.json`, `docs/postman_collection.json`).
+- Security helpers (`app/security/{passwords,tokens,email_tokens}.py`): argon2 password hashing, JWT access/refresh with type-checked `decode_token`, and verify/reset email-token helpers.
+- `README.md`: project overview, tech stack, setup from scratch, run/test commands, folder map and docs links.
+- Tests (`backend/tests/test_security.py`, `test_auth.py`, `test_repos.py`, `test_stubs.py`, `conftest.py`): 103 passing.
+
+Not implemented yet (registered as `501` stubs, built in Parts 2–4):
+- Deterministic pipeline and analysis (`app/pipeline/*`, `app/analysis/*`), background tasks (`app/tasks`).
+- AI layer (`app/ai/*`) and the agent layer (`app/agent` router is a stub only).
+- Frontend (`frontend/` — `.gitkeep` only).
+- Docker orchestration (`docker/docker-compose.yml` empty, no Dockerfile).
+- Evals (`evals/*` — `.gitkeep` only) and helper scripts (`scripts/` — `.gitkeep` only).
+
+Part 1 status: **the backend is complete** — auth, repos, all Part 2–4 stubs, the error contract, tests, README, and the OpenAPI/Postman docs all exist and pass. The only Part 1 "Done when" item not yet true in this repository is opening the **Repo Detail page**, because the frontend pages are a separate team deliverable (`frontend/` is empty). Part 1 is therefore backend-complete, not whole-product-complete.
+
+## Running It Locally
+
+Prerequisites:
+- Python 3.11+ (the checked-in venv runs Python 3.14.2).
+- A virtual environment at `backend/.venv`.
+
+Setup (run from the repo root; all app commands run from `backend/` with the venv active):
+```bash
+cd backend
+source .venv/bin/activate
+pip install -r requirements.txt        # runtime deps
+pip install -r requirements-dev.txt    # also pulls pytest + httpx for tests
+```
+
+Environment variables:
+- Copy the template and edit it: `cp .env.example .env`
+- Required: `SECRET_KEY` (no default). Generate one with:
+  `python -c "import secrets; print(secrets.token_urlsafe(32))"`
+- Others (all have defaults): `APP_NAME`, `ENV`, `DATABASE_URL`, `ACCESS_TOKEN_EXPIRE_MINUTES`, `REFRESH_TOKEN_EXPIRE_DAYS`, `VERIFY_TOKEN_EXPIRE_HOURS`, `RESET_TOKEN_EXPIRE_MINUTES`, `RATE_LIMIT_LOGIN`, `RATE_LIMIT_SIGNUP`, `RATE_LIMIT_FORGOT_PASSWORD`, `RATE_LIMIT_RESEND_VERIFICATION`, `FRONTEND_URL`, `CORS_ORIGINS`, `SMTP_HOST`, `SMTP_PORT`, `SMTP_USER`, `SMTP_PASSWORD`, `EMAIL_FROM`.
+
+Create/verify the database (from `backend/`):
+```bash
+alembic upgrade head      # creates backend/repotrackr.db with users, email_tokens, repos
+alembic check             # verifies models match the migration
+alembic downgrade base    # rolls the schema back (drops the tables)
+```
+
+How to verify it works:
+- After `alembic upgrade head`, `backend/repotrackr.db` should exist.
+- `alembic check` should say there are no new upgrade operations.
+- Sanity-check config: `python -c "from app.core.config import get_settings; print(get_settings().APP_NAME)"`.
+
+Run the API (from `backend/`, venv active):
+```bash
+uvicorn app.main:app --reload        # serves http://127.0.0.1:8000
+curl http://127.0.0.1:8000/health    # -> {"status":"ok"}
+```
+Swagger UI is at `http://127.0.0.1:8000/docs` (endpoints grouped by tag: `system`, `auth`, `repos`, `stubs`) and the raw spec at `/openapi.json` (also exported to `docs/openapi.json`). `GET /health` answers as long as the app imports. The full auth surface is live under `/auth` (`signup`, `verify-email`, `resend-verification`, `login`, `refresh`, `logout`, `forgot-password`, `reset-password`, `change-password`, `account`, `me` — see `docs/api_contract.md`), and repo CRUD is live under `/repos` (`POST`, `GET`, `GET /{id}`, `DELETE /{id}`, all requiring a Bearer token). The Part 2–4 routes (indexing, plan, reader, context, query, agent/trace, evals) are registered but return `501 {"status": "not_implemented"}`; repo-scoped ones still enforce the same 401/404 rules. To see verification/reset links locally, leave `SMTP_HOST` empty in `.env`: the messages are logged to the server console with their `http://localhost:3000/...?token=...` links.
+
+Run the tests (from `backend/`, venv active):
+```bash
+python -m pytest tests/ -q             # all tests (security + auth + repos + stubs)
+python -m pytest tests/test_security.py -q
+python -m pytest tests/test_auth.py -q
+python -m pytest tests/test_repos.py -q
+python -m pytest tests/test_stubs.py -q
+```
+
+## Where You Can Help
+
+- **Layer 7, `app/main.py`:** the app factory exists and now includes all routers (auth, repos, and the Part 2–4 stubs) — replace stub routers with real ones and extend middleware as features are built.
+- **Layer 7, `app/security/`:** helpers exist and are tested — extend them (e.g. token rehash checks) as auth needs grow.
+- **Layer 7, `app/schemas/`:** schemas for Part 1 exist (plus `stub.py`) — extend them (and `docs/api_contract.md`/`docs/mock_responses.md`/`docs/openapi.json`/`docs/postman_collection.json`) when endpoints change.
+- **Layer 7, `app/features/auth/`:** the full Part 1 auth surface (signup/verify/resend/login/refresh/logout/forgot/reset/change/delete/me) plus rate limiting is built; `get_current_user` is reused by the repos feature and every repo-scoped stub.
+- **Layer 7, `app/core/ratelimit.py`:** limits exist for the abuse-prone auth endpoints — add them to other sensitive endpoints and consider a shared storage (Redis) for multi-process deploys.
+- **Layer 7, `app/features/repos/`:** repo CRUD plus `get_owned_repo` are built; Part 2 flips `status` through the pipeline instead of leaving it at `"added"`.
+- **Layer 7, stub routers:** `app/features/{indexing,plan,reader,context}/router.py` and `app/agent/router.py` return `501`; implement them in Parts 2–4 (they already enforce ownership).
+- **Layer 2/3:** register a second model change by adding a model then running `alembic revision --autogenerate`; test `render_as_batch` behavior on SQLite.
+- **Layer 5, `app/pipeline/clone` + `cache`:** start the cloning/caching step that turns a `Repo` row into local files.
+- **Layer 5, `app/analysis/retrieval`:** make sure every future AI claim can attach a real `file:line`, per the design rule.
+- **Layer 9:** fill `docker/docker-compose.yml` and add a Dockerfile; stand up the `evals/` harnesses.
+- **Tests:** `test_security.py`, `test_auth.py`, `test_repos.py`, and `test_stubs.py` exist — extend them (e.g. `Settings` validation, `get_db()` lifecycle, migration up/down, real pipeline endpoints).
+
+## How To Contribute
+
+Fork and branch:
+- Fork the repo, then create a branch for the step you're doing. This repo names work by step, so follow that: `step-1d-app-factory`, `step-2a-clone`, etc.
+- Keep changes scoped to one step/layer; don't build ahead (see `AGENTS.md`).
+
+Commit style (matches existing history):
+- Prefix with the step, then a short description: `Step 1C: Alembic and first migration`, `Step 1B: Database session and models`, `Step 1A: venv, pinned requirements, config`.
+- One logical change per commit.
+
+PR checklist:
+- [ ] The code actually runs (verify, don't assume).
+- [ ] Public names are real, typed, and consistent with existing files.
+- [ ] If env vars/endpoints/migrations changed, they're reflected in `backend/.env.example` and `docs/changes.md`.
+- [ ] Every new claim-bearing feature cites `file:line` (design rule).
+- [ ] No secrets committed (`backend/.env`, `*.db` stay gitignored).
+- [ ] `docs/changes.md` gets a new entry (step, date, files, why, new commands/env/endpoints/migrations, known issues).
+
+Code conventions already used in the repo:
+- Python type hints everywhere, including SQLAlchemy 2.0 typed mappings (`Mapped[...]`, `mapped_column(...)`).
+- Timezone-aware datetimes via `datetime.now(timezone.utc)`.
+- `snake_case` for files/functions, `PascalCase` for classes, `UPPER_SNAKE_CASE` for settings and enum members.
+- Config via the cached `get_settings()`, never raw `os.environ`; DB sessions via `get_db()`.
+- Packages expose their public API through `__init__.py` with `__all__` (see `app/models/__init__.py`).
+- Keep deterministic code (`pipeline/`, `analysis/`) separate from LLM code (`ai/`, `agent/`).
+- Add any dependency to `backend/requirements.txt` before installing it.
